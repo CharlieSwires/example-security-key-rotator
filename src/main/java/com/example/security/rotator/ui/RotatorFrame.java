@@ -51,7 +51,7 @@ public final class RotatorFrame extends JFrame {
 
     private final JTextField projectPath = new JTextField();
     private final JPasswordField mongoUri = new JPasswordField();
-    private final JTextField database = new JTextField("example_security");
+    private final JTextField database = new JTextField();
     private final JPasswordField oldPassphrase = new JPasswordField();
     private final JTextField oldSalt = new JTextField();
     private final JPasswordField newPassphrase = new JPasswordField();
@@ -59,7 +59,7 @@ public final class RotatorFrame extends JFrame {
     private final JSpinner batchSize = new JSpinner(new SpinnerNumberModel(100, 1, 1000, 10));
     private final JCheckBox resume = new JCheckBox("Resume an investigated incomplete rotation");
     private final JCheckBox backupConfirmed = new JCheckBox("A current backup has been taken and verified");
-    private final JCheckBox maintenanceConfirmed = new JCheckBox("All ExampleSecurity backends are stopped or drained");
+    private final JCheckBox maintenanceConfirmed = new JCheckBox("All application backends using this database are stopped or drained");
     private final JTextArea output = new JTextArea(11, 72);
     private final JProgressBar progress = new JProgressBar();
     private final JLabel status = new JLabel("Ready");
@@ -70,7 +70,7 @@ public final class RotatorFrame extends JFrame {
     private SwingWorker<RotationReport, String> worker;
 
     public RotatorFrame() {
-        super("ExampleSecurity Key & Salt Rotator");
+        super("MongoDB Encryption Key & Salt Rotator");
         installLookAndFeel();
         setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
         setMinimumSize(new Dimension(900, 820));
@@ -100,7 +100,7 @@ public final class RotatorFrame extends JFrame {
         title.setAlignmentX(LEFT_ALIGNMENT);
         card.add(title);
 
-        JLabel subtitle = new JLabel("Offline maintenance utility for ExampleSecurity MongoDB");
+        JLabel subtitle = new JLabel("Filesystem-schema driven offline MongoDB maintenance utility");
         subtitle.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 15));
         subtitle.setForeground(MUTED);
         subtitle.setBorder(new EmptyBorder(4, 0, 22, 0));
@@ -154,12 +154,12 @@ public final class RotatorFrame extends JFrame {
         JButton browseProject = button("Browse…", new Color(108, 117, 125));
         browseProject.addActionListener(event -> chooseProjectDirectory());
         projectRow.add(browseProject, BorderLayout.EAST);
-        addField(panel, row++, "ExampleSecurity project directory", projectRow,
-                "Select the folder containing backend/src/main/java");
+        addField(panel, row++, "MongoDB model source directory", projectRow,
+                "Select the Java folder containing your @Document model classes");
 
         addField(panel, row++, "MongoDB connection URL", mongoUri,
                 "Use the Atlas or TLS/allowlisted Krystal backup-style URL");
-        addField(panel, row++, "Database", database, "Normally example_security");
+        addField(panel, row++, "Database", database, "MongoDB database containing these model collections");
         addField(panel, row++, "Old passphrase", oldPassphrase, "Current production passphrase");
         addField(panel, row++, "Old master salt (Base64)", oldSalt, "Existing salt; 16+ decoded bytes");
         addField(panel, row++, "New passphrase", newPassphrase, "Use a new long random word string");
@@ -253,7 +253,7 @@ public final class RotatorFrame extends JFrame {
 
     private void chooseProjectDirectory() {
         JFileChooser chooser = new JFileChooser();
-        chooser.setDialogTitle("Select ExampleSecurity project directory");
+        chooser.setDialogTitle("Select MongoDB Java model source directory");
         chooser.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
         if (!projectPath.getText().isBlank()) chooser.setCurrentDirectory(new java.io.File(projectPath.getText()));
         if (chooser.showOpenDialog(this) == JFileChooser.APPROVE_OPTION) {
@@ -278,12 +278,13 @@ public final class RotatorFrame extends JFrame {
     }
 
     private void testConnection() {
-        try { requireFilesystemSchema(); } catch (RuntimeException ex) { showError(ex); return; }
+        final ProjectSchemaScanner.SchemaReport schema;
+        try { schema = requireFilesystemSchema(); } catch (RuntimeException ex) { showError(ex); return; }
         char[] uri = mongoUri.getPassword();
         setBusy(true, "Testing MongoDB connection…");
         SwingWorker<Void, Void> connectionWorker = new SwingWorker<>() {
             @Override protected Void doInBackground() {
-                new RotationEngine().testConnection(uri, database.getText());
+                new RotationEngine(schema).testConnection(uri, database.getText());
                 return null;
             }
 
@@ -332,7 +333,7 @@ public final class RotatorFrame extends JFrame {
         setBusy(true, rotate ? "Rotation running" : "Dry-run check running");
         worker = new SwingWorker<>() {
             @Override protected RotationReport doInBackground() {
-                RotationEngine engine = new RotationEngine(filesystemSchema.collections());
+                RotationEngine engine = new RotationEngine(filesystemSchema);
                 return rotate
                         ? engine.rotate(config, (message, count) -> publish(message + " — " + count + " documents"))
                         : engine.check(config, (message, count) -> publish(message + " — " + count + " documents"));
@@ -388,13 +389,40 @@ public final class RotatorFrame extends JFrame {
     }
 
     private void showError(Throwable error) {
-        Throwable current = error;
-        while (current.getCause() != null && current.getCause() != current) current = current.getCause();
-        String message = current.getMessage();
-        if (message == null || message.isBlank()) message = current.getClass().getSimpleName();
+        String message = usefulErrorMessage(error);
         output.append(System.lineSeparator() + "ERROR: " + message + System.lineSeparator());
         status.setText("Operation failed");
         JOptionPane.showMessageDialog(this, message, "Operation failed", JOptionPane.ERROR_MESSAGE);
+    }
+
+    /**
+     * Keep the rotator's contextual exception instead of unwrapping to a low-level
+     * JCE message such as "Tag mismatch", which loses collection/id/field details.
+     */
+    private static String usefulErrorMessage(Throwable error) {
+        Throwable current = error;
+        while (current != null) {
+            String message = current.getMessage();
+            if (message != null && !message.isBlank()) {
+                if (message.contains("Collection:") || message.contains("Document _id:")
+                        || message.startsWith("MongoDB collection ") || message.startsWith("Filesystem")) {
+                    return message;
+                }
+            }
+            current = current.getCause();
+        }
+
+        current = error;
+        while (current != null) {
+            String message = current.getMessage();
+            if (message != null && !message.isBlank()
+                    && !"Tag mismatch".equalsIgnoreCase(message)
+                    && !message.toLowerCase(java.util.Locale.ROOT).contains("tag mismatch")) {
+                return message;
+            }
+            current = current.getCause();
+        }
+        return "Cryptographic operation failed. No safe diagnostic message was available.";
     }
 
     private static JButton button(String text, Color background) {

@@ -21,14 +21,14 @@ public final class RotatorApplication {
     static int runCli(Map<String, String> env) {
         String mode = env.getOrDefault("ROTATOR_MODE", "check").trim().toLowerCase(Locale.ROOT);
         try (RotationConfig config = RotationConfig.fromEnvironment(env)) {
-            String projectDir = env.get("EXAMPLE_SECURITY_PROJECT_DIR");
+            String projectDir = env.get("ROTATOR_MODEL_SOURCE_DIR");
             if (projectDir == null || projectDir.isBlank()) {
-                throw new IllegalArgumentException("EXAMPLE_SECURITY_PROJECT_DIR is required for the filesystem-schema rotator");
+                throw new IllegalArgumentException("ROTATOR_MODEL_SOURCE_DIR is required and must point at the Java MongoDB model source directory");
             }
             ProjectSchemaScanner.SchemaReport schema = new ProjectSchemaScanner()
                     .scanAndRequireCompatible(java.nio.file.Path.of(projectDir));
             System.out.println(schema.summary());
-            RotationEngine engine = new RotationEngine(schema.collections());
+            RotationEngine engine = new RotationEngine(schema);
             RotationReport report;
             if ("check".equals(mode)) {
                 report = engine.check(config, ProgressListener.CONSOLE);
@@ -57,8 +57,15 @@ public final class RotatorApplication {
 
     private static String safeMessage(Throwable error) {
         Throwable current = error;
-        while (current.getCause() != null && current.getCause() != current) current = current.getCause();
-        String message = current.getMessage();
-        return message == null || message.isBlank() ? current.getClass().getSimpleName() : message;
+        while (current != null) {
+            String message = current.getMessage();
+            if (message != null && !message.isBlank()
+                    && !"Tag mismatch".equalsIgnoreCase(message)
+                    && !message.toLowerCase(Locale.ROOT).contains("tag mismatch")) {
+                return message;
+            }
+            current = current.getCause();
+        }
+        return "Cryptographic operation failed. No safe diagnostic message was available.";
     }
 }

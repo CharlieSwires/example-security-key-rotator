@@ -7,7 +7,7 @@
     <groupId>com.example.security</groupId>
     <artifactId>example-security-key-rotator</artifactId>
     <version>1.0.0</version>
-    <name>ExampleSecurity offline key rotator</name>
+    <name>Filesystem-schema MongoDB key rotator</name>
     <description>Offline Swing and CLI field-encryption key/salt rotation utility</description>
 
     <properties>

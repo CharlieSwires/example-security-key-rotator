@@ -40,7 +40,7 @@ public final class RotationConfig implements AutoCloseable {
     public static RotationConfig fromEnvironment(Map<String, String> env) {
         return new RotationConfig(
                 chars(env.get("MONGODB_URI")),
-                env.getOrDefault("ROTATOR_DATABASE", "example_security"),
+                env.get("ROTATOR_DATABASE"),
                 chars(env.get("OLD_FIELD_CRYPTO_PASSPHRASE")),
                 env.get("OLD_FIELD_CRYPTO_MASTER_SALT_B64"),
                 chars(env.get("NEW_FIELD_CRYPTO_PASSPHRASE")),

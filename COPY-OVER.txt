@@ -1,0 +1,24 @@
+COPY-OVER VERSION
+=================
+
+This replaces the previous filesystem-schema rotator.
+
+Main change:
+- The GUI now asks for the Java MongoDB MODEL SOURCE DIRECTORY itself.
+- The target project does NOT have to be called example-security.
+- The target package does NOT have to be com.example.security.
+- Collection names and encrypted field names are discovered from the selected model source.
+- The only deliberate field convention is that encrypted String fields end in "Encrypted".
+- Nested embedded model objects/lists are followed recursively.
+- Null/blank encrypted values are left alone (no decrypt/encrypt attempt).
+- FooLookupHash is automatically regenerated when it is a sibling of FooEncrypted.
+- MongoDB *Encrypted paths absent from the selected source block rotation, so an old-key value is not silently stranded.
+
+Recommended first action: run Dry-run check.
+
+2026-09-06 diagnostic fix:
+- Dry-run errors preserve collection, MongoDB _id and exact nested field path.
+- GUI no longer unwraps useful context down to the JCE "Tag mismatch" cause.
+- AES-GCM mismatch with both OLD and NEW secrets is reported explicitly.
+- Malformed/corrupt enc:v1 payloads are distinguished from wrong-key authentication failures.
+- Dry run remains read-only; null/blank encrypted fields remain skipped.

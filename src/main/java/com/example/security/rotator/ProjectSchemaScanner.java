@@ -15,121 +15,229 @@ import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
 /**
- * Reads the actual ExampleSecurity Java source tree before a rotation and
- * verifies that the encrypted MongoDB schema still matches the fields the
- * rotation engine is designed to process.
+ * Discovers encrypted MongoDB fields from a user-selected Java model source directory.
+ *
+ * Contract: String fields whose Java (or @Field) name ends in "Encrypted" are encrypted.
+ * Project name, package name, collection names, model names and nesting are discovered.
  */
 public final class ProjectSchemaScanner {
-    private static final Pattern DOCUMENT = Pattern.compile("@Document\\s*\\(\\s*collection\\s*=\\s*\"([^\"]+)\"");
-    private static final Pattern ENCRYPTED_FIELD = Pattern.compile("\\b(?:private|protected|public)\\s+String\\s+([A-Za-z0-9_]+Encrypted)\\s*[;=]");
+    private static final Pattern DOCUMENT = Pattern.compile(
+            "@Document\\s*\\((?:[^)]*?collection\\s*=\\s*)?\\\"([^\\\"]+)\\\"[^)]*\\)", Pattern.DOTALL);
+    private static final Pattern DOCUMENT_NO_ARG = Pattern.compile("@Document\\b(?!\\s*\\()|@Document\\s*\\(\\s*\\)");
+    private static final Pattern CLASS = Pattern.compile("\\b(?:class|record)\\s+([A-Za-z_$][A-Za-z0-9_$]*)\\b");
+    private static final Pattern FIELD = Pattern.compile(
+            "(?s)(@Field\\s*\\(\\s*\\\"([^\\\"]+)\\\"\\s*\\)\\s*)?" +
+            "(?:private|protected|public)\\s+(?:final\\s+)?([^;=]+?)\\s+([A-Za-z_$][A-Za-z0-9_$]*)\\s*(?:=[^;]*)?;");
+    private static final Pattern LIST_TYPE = Pattern.compile("(?:List|Collection|Set|Iterable)\\s*<\\s*([A-Za-z_$][A-Za-z0-9_$.]*)\\s*>");
 
-    /**
-     * Paths the current rotation engine knows how to process safely.
-     * The filesystem schema is authoritative: fields absent from the application source are
-     * not required and are not touched. This map is only an upper safety bound, so a newly
-     * introduced encrypted field still stops the rotation until support is added deliberately.
-     */
-    private static final Map<String, Set<String>> SUPPORTED = Map.of(
-            "users", Set.of("displayNameEncrypted", "telephoneEncrypted", "totpSecretEncrypted"),
-            "offices", Set.of("addressEncrypted", "telephoneEncrypted"),
-            "patient_appointment_documents", Set.of(
-                    "patientDisplayNameEncrypted", "patientTelephoneEncrypted", "clinicNameEncrypted",
-                    "clinicianEncrypted", "prescriptionEncrypted", "notes[].subjectEncrypted",
-                    "notes[].noteTextEncrypted", "notes[].prescriptionEncrypted")
-    );
-
-    public SchemaReport scan(Path projectRoot) {
-        Path root = validateProjectRoot(projectRoot);
-        Path javaRoot = root.resolve("backend/src/main/java");
-        Map<String, Set<String>> found = new LinkedHashMap<>();
-        List<String> inspected = new ArrayList<>();
-
-        try (Stream<Path> paths = Files.walk(javaRoot)) {
-            paths.filter(p -> p.toString().endsWith(".java")).forEach(path -> inspect(path, found, inspected));
+    public SchemaReport scan(Path modelSourceDirectory) {
+        Path root = validateModelSourceDirectory(modelSourceDirectory);
+        List<Path> javaFiles = new ArrayList<>();
+        try (Stream<Path> paths = Files.walk(root)) {
+            paths.filter(p -> p.toString().endsWith(".java")).forEach(javaFiles::add);
         } catch (IOException ex) {
-            throw new IllegalArgumentException("Could not scan ExampleSecurity source tree: " + ex.getMessage(), ex);
+            throw new IllegalArgumentException("Could not scan model source directory: " + ex.getMessage(), ex);
+        }
+        if (javaFiles.isEmpty()) {
+            return new SchemaReport(root, Map.of(), Map.of(), 0,
+                    List.of("No .java model files were found in the selected directory"));
         }
 
+        Map<String, ClassInfo> classes = new LinkedHashMap<>();
+        List<DocumentClass> documents = new ArrayList<>();
+        for (Path file : javaFiles) parseFile(file, classes, documents);
+
+        Map<String, Set<String>> encrypted = new LinkedHashMap<>();
+        Map<String, Map<String, String>> lookupHashes = new LinkedHashMap<>();
         List<String> problems = new ArrayList<>();
-        for (Map.Entry<String, Set<String>> actualEntry : found.entrySet()) {
-            Set<String> supported = SUPPORTED.get(actualEntry.getKey());
-            if (supported == null) {
-                if (!actualEntry.getValue().isEmpty()) {
-                    problems.add("Unsupported MongoDB collection with encrypted fields: "
-                            + actualEntry.getKey() + " -> " + actualEntry.getValue());
-                }
-                continue;
+
+        for (DocumentClass document : documents) {
+            ClassInfo info = classes.get(document.className());
+            if (info == null) continue;
+            String collection = document.collection();
+            if (collection == null || collection.isBlank()) {
+                collection = lowerFirst(document.className());
             }
-            Set<String> unsupported = new LinkedHashSet<>(actualEntry.getValue());
-            unsupported.removeAll(supported);
-            if (!unsupported.isEmpty()) {
-                problems.add(actualEntry.getKey() + " has encrypted paths not yet supported by the rotation engine: "
-                        + unsupported);
+            Set<String> paths = encrypted.computeIfAbsent(collection, ignored -> new LinkedHashSet<>());
+            Map<String, String> hashes = lookupHashes.computeIfAbsent(collection, ignored -> new LinkedHashMap<>());
+            discover(info, "", classes, paths, hashes, new LinkedHashSet<>(), problems);
+            if (paths.isEmpty()) {
+                encrypted.remove(collection);
+                lookupHashes.remove(collection);
             }
         }
-        if (found.isEmpty()) problems.add("No @Document MongoDB models with encrypted fields were found under backend/src/main/java");
 
-        return new SchemaReport(root, found, inspected.size(), problems);
+        if (documents.isEmpty()) problems.add("No Spring Data @Document model classes were found");
+        if (encrypted.isEmpty()) problems.add("No fields ending in Encrypted were found in any @Document model");
+        return new SchemaReport(root, encrypted, lookupHashes, javaFiles.size(), problems);
     }
 
-    public SchemaReport scanAndRequireCompatible(Path projectRoot) {
-        SchemaReport report = scan(projectRoot);
+    public SchemaReport scanAndRequireCompatible(Path modelSourceDirectory) {
+        SchemaReport report = scan(modelSourceDirectory);
         if (!report.compatible()) throw new IllegalArgumentException(report.problemSummary());
         return report;
     }
 
-    private static Path validateProjectRoot(Path path) {
-        if (path == null) throw new IllegalArgumentException("ExampleSecurity project path is required");
+    private static Path validateModelSourceDirectory(Path path) {
+        if (path == null || path.toString().isBlank())
+            throw new IllegalArgumentException("MongoDB model source directory is required");
         Path root = path.toAbsolutePath().normalize();
-        if (!Files.isDirectory(root)) throw new IllegalArgumentException("ExampleSecurity project path is not a directory: " + root);
-        if (!Files.isDirectory(root.resolve("backend/src/main/java"))) {
-            throw new IllegalArgumentException("That directory does not look like ExampleSecurity: expected backend/src/main/java under " + root);
-        }
+        if (!Files.isDirectory(root))
+            throw new IllegalArgumentException("Model source path is not a directory: " + root);
         return root;
     }
 
-    private static void inspect(Path path, Map<String, Set<String>> found, List<String> inspected) {
+    private static void parseFile(Path path, Map<String, ClassInfo> classes, List<DocumentClass> documents) {
         try {
-            String text = Files.readString(path, StandardCharsets.UTF_8);
-            inspected.add(path.toString());
-            Matcher document = DOCUMENT.matcher(text);
-            if (!document.find()) return;
-            String collection = document.group(1);
-            Set<String> encrypted = found.computeIfAbsent(collection, ignored -> new LinkedHashSet<>());
+            String text = stripComments(Files.readString(path, StandardCharsets.UTF_8));
+            Matcher classMatcher = CLASS.matcher(text);
+            while (classMatcher.find()) {
+                String className = classMatcher.group(1);
+                int open = text.indexOf('{', classMatcher.end());
+                if (open < 0) continue;
+                int close = matchingBrace(text, open);
+                if (close < 0) continue;
+                String body = text.substring(open + 1, close);
+                String directBody = removeNestedClassBodies(body);
+                ClassInfo info = new ClassInfo(className, parseFields(directBody));
+                classes.putIfAbsent(className, info);
 
-            // Top-level encrypted String fields.
-            Matcher field = ENCRYPTED_FIELD.matcher(text);
-            while (field.find()) encrypted.add(field.group(1));
-
-            // PatientClinicalNote is currently the only embedded encrypted array in ExampleSecurity.
-            // Detect it from the source rather than assuming its fields are present.
-            if (text.contains("class PatientClinicalNote") && text.contains("List<PatientClinicalNote> notes")) {
-                int nestedStart = text.indexOf("class PatientClinicalNote");
-                String nested = text.substring(nestedStart);
-                Matcher nestedField = ENCRYPTED_FIELD.matcher(nested);
-                while (nestedField.find()) {
-                    String name = nestedField.group(1);
-                    encrypted.remove(name); // remove the unqualified nested match added by whole-file scan
-                    encrypted.add("notes[]." + name);
-                }
+                String prefix = text.substring(Math.max(0, classMatcher.start() - 1200), classMatcher.start());
+                int previousClass = Math.max(prefix.lastIndexOf(" class "), prefix.lastIndexOf(" record "));
+                String annotations = previousClass >= 0 ? prefix.substring(previousClass) : prefix;
+                Matcher doc = DOCUMENT.matcher(annotations);
+                String collection = null;
+                boolean isDocument = false;
+                while (doc.find()) { isDocument = true; collection = doc.group(1); }
+                if (!isDocument && DOCUMENT_NO_ARG.matcher(annotations).find()) isDocument = true;
+                if (isDocument) documents.add(new DocumentClass(className, collection));
             }
         } catch (IOException ex) {
-            throw new RuntimeException("Could not read " + path + ": " + ex.getMessage(), ex);
+            throw new IllegalArgumentException("Could not read " + path + ": " + ex.getMessage(), ex);
         }
     }
 
-    public record SchemaReport(Path projectRoot, Map<String, Set<String>> collections,
-                               int javaFilesInspected, List<String> problems) {
+    private static List<FieldInfo> parseFields(String body) {
+        List<FieldInfo> fields = new ArrayList<>();
+        Matcher matcher = FIELD.matcher(body);
+        while (matcher.find()) {
+            String mongoName = matcher.group(2);
+            String type = matcher.group(3).trim();
+            String javaName = matcher.group(4);
+            fields.add(new FieldInfo(javaName, mongoName == null ? javaName : mongoName, type));
+        }
+        return fields;
+    }
+
+    private static void discover(ClassInfo info, String prefix, Map<String, ClassInfo> classes,
+                                 Set<String> encryptedPaths, Map<String, String> lookupHashes,
+                                 Set<String> stack, List<String> problems) {
+        if (!stack.add(info.name())) return;
+        try {
+            Map<String, FieldInfo> byJavaName = new LinkedHashMap<>();
+            for (FieldInfo field : info.fields()) byJavaName.put(field.javaName(), field);
+
+            for (FieldInfo field : info.fields()) {
+                String mongoPath = prefix + field.mongoName();
+                if (isString(field.type()) && field.mongoName().endsWith("Encrypted")) {
+                    encryptedPaths.add(mongoPath);
+                    String base = field.javaName().substring(0, field.javaName().length() - "Encrypted".length());
+                    FieldInfo hash = byJavaName.get(base + "LookupHash");
+                    if (hash != null && isString(hash.type())) lookupHashes.put(mongoPath, prefix + hash.mongoName());
+                    continue;
+                }
+
+                String nestedType = nestedType(field.type());
+                if (nestedType == null) continue;
+                ClassInfo nested = classes.get(simpleName(nestedType));
+                if (nested == null) continue;
+                boolean array = LIST_TYPE.matcher(field.type()).find() || field.type().trim().endsWith("[]");
+                discover(nested, mongoPath + (array ? "[]." : "."), classes,
+                        encryptedPaths, lookupHashes, stack, problems);
+            }
+        } finally {
+            stack.remove(info.name());
+        }
+    }
+
+    private static boolean isString(String type) {
+        String t = type.replace("java.lang.", "").trim();
+        return "String".equals(t);
+    }
+
+    private static String nestedType(String type) {
+        Matcher list = LIST_TYPE.matcher(type);
+        if (list.find()) return list.group(1);
+        String t = type.trim().replace("[]", "");
+        if (t.contains("<") || isString(t) || t.matches("(?:boolean|byte|short|int|long|float|double|char|Boolean|Byte|Short|Integer|Long|Float|Double|Character|Object|LocalDate|LocalDateTime|Instant|Date|BigDecimal|BigInteger)")) return null;
+        return t;
+    }
+
+    private static String simpleName(String type) {
+        int dot = type.lastIndexOf('.');
+        return dot < 0 ? type : type.substring(dot + 1);
+    }
+
+    private static String stripComments(String text) {
+        return text.replaceAll("(?s)/\\*.*?\\*/", " ").replaceAll("(?m)//.*$", " ");
+    }
+
+    private static String removeNestedClassBodies(String body) {
+        StringBuilder result = new StringBuilder(body);
+        Matcher matcher = CLASS.matcher(body);
+        while (matcher.find()) {
+            int open = body.indexOf('{', matcher.end());
+            if (open < 0) continue;
+            int close = matchingBrace(body, open);
+            if (close < 0) continue;
+            for (int i = matcher.start(); i <= close && i < result.length(); i++) result.setCharAt(i, ' ');
+        }
+        return result.toString();
+    }
+
+    private static int matchingBrace(String text, int open) {
+        int depth = 0;
+        boolean string = false, character = false, escape = false;
+        for (int i = open; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (escape) { escape = false; continue; }
+            if ((string || character) && c == '\\') { escape = true; continue; }
+            if (!character && c == '"') { string = !string; continue; }
+            if (!string && c == '\'') { character = !character; continue; }
+            if (string || character) continue;
+            if (c == '{') depth++;
+            else if (c == '}' && --depth == 0) return i;
+        }
+        return -1;
+    }
+
+    private static String lowerFirst(String value) {
+        return value.isEmpty() ? value : Character.toLowerCase(value.charAt(0)) + value.substring(1);
+    }
+
+    private record ClassInfo(String name, List<FieldInfo> fields) { }
+    private record FieldInfo(String javaName, String mongoName, String type) { }
+    private record DocumentClass(String className, String collection) { }
+
+    public record SchemaReport(Path modelSourceDirectory,
+                               Map<String, Set<String>> collections,
+                               Map<String, Map<String, String>> lookupHashes,
+                               int javaFilesInspected,
+                               List<String> problems) {
         public boolean compatible() { return problems.isEmpty(); }
         public String problemSummary() { return String.join(System.lineSeparator(), problems); }
         public String summary() {
             StringBuilder b = new StringBuilder();
-            b.append("Filesystem schema scan: ").append(projectRoot).append(System.lineSeparator());
+            b.append("Model schema scan: ").append(modelSourceDirectory).append(System.lineSeparator());
             b.append("Java files inspected: ").append(javaFilesInspected).append(System.lineSeparator());
-            collections.forEach((collection, paths) -> b.append(collection).append(" -> ").append(paths).append(System.lineSeparator()));
+            collections.forEach((collection, paths) -> {
+                b.append(collection).append(" -> ").append(paths).append(System.lineSeparator());
+                Map<String, String> hashes = lookupHashes.get(collection);
+                if (hashes != null && !hashes.isEmpty()) b.append("  lookup hashes -> ").append(hashes).append(System.lineSeparator());
+            });
             b.append(compatible()
-                    ? "Filesystem schema accepted. Only the encrypted paths listed above will be checked/rotated."
-                    : "SCHEMA MISMATCH:\n" + problemSummary());
+                    ? "Schema accepted. Only discovered *Encrypted paths will be checked/rotated."
+                    : "SCHEMA ERROR:\n" + problemSummary());
             return b.toString();
         }
     }

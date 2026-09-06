@@ -1,60 +1,150 @@
-# ExampleSecurity Key Rotator — Filesystem Schema Checked
+# MongoDB Encryption Key & Salt Rotator — Filesystem Schema Driven
 
-This is the **filesystem-schema** variant of the standalone Java 17 key/salt rotator.
+This is an **offline maintenance utility** for rotating the passphrase and master salt used by the `FieldCrypto` AES-256-GCM format (`enc:v1:`).
 
-The important difference from the ordinary rotator is that it **asks for the path to your actual `example-security` project before it will touch MongoDB**.
+## The important design rule
 
-The selected directory must contain:
+The rotator contains **no project-name, package-name, collection-name, model-class-name or application-field-name knowledge**.
+
+You select the Java directory that contains your Spring Data MongoDB model classes, for example:
 
 ```text
-example-security/
-  backend/
-    src/main/java/
+C:\Users\charlie\eclipse-workspace\example-security\backend\src\main\java\com\example\security\model
 ```
 
-The utility scans the Spring Data MongoDB model source beneath that directory, discovers the `@Document(collection=...)` collections and fields whose Java names end in `Encrypted`, including the encrypted fields in `PatientClinicalNote` as `notes[].…` paths.
+The project could just as well be called `hospital-system`, `accounts`, or anything else. The package can also be anything.
 
-The **filesystem-derived schema is authoritative**. The rotator only checks and rotates encrypted fields that actually exist in the selected `example-security` source tree. If an older field has disappeared from the application model (for example a former top-level `prescriptionEncrypted`), it is not required and it is not touched in MongoDB.
+The one deliberate convention is:
 
-The program still has a deliberately small **supported-path safety bound**. If the filesystem scanner discovers a *new* encrypted field or encrypted collection that the rotation engine does not yet know how to process safely, dry-run and rotation are blocked until support is added. This avoids silently missing newly introduced encrypted data.
+> **A String MongoDB model field whose Java name or `@Field` MongoDB name ends in `Encrypted` is treated as encrypted data.**
 
-## What the program asks for
+That convention is the contract between the application and this utility.
 
-The Swing GUI asks for:
+## What the scanner discovers
 
-1. **ExampleSecurity project directory** — browse to the real `example-security` source folder.
-2. MongoDB connection URL.
-3. Database name (normally `example_security`).
-4. Current field-encryption passphrase.
-5. Current Base64 master salt.
-6. New passphrase.
-7. New Base64 master salt (or generate a new 32-byte salt).
-8. Batch size.
+Starting at the selected model source directory, it recursively scans `.java` files and discovers:
 
-Before any MongoDB operation it prints the filesystem schema it found. **Only those discovered encrypted paths are processed.** Null or blank stored values are skipped by the crypto classifier and are never decrypted.
+- Spring Data `@Document` classes and their MongoDB collection names;
+- `String` fields ending in `Encrypted`;
+- `@Field("...")` names where present;
+- embedded model objects;
+- embedded arrays/lists such as `notes[].prescriptionEncrypted`;
+- sibling `FooLookupHash` fields for a discovered `FooEncrypted` field.
 
-## Build and run
+Example:
 
-Requires JDK 17+ and Maven 3.9+:
+```java
+@Document(collection = "patient_appointment_documents")
+class Appointment {
+    private String patientDisplayNameEncrypted;
+    private String patientDisplayNameLookupHash;
+    private List<PatientClinicalNote> notes;
+}
+
+class PatientClinicalNote {
+    private String subjectEncrypted;
+    private String noteTextEncrypted;
+    private String prescriptionEncrypted;
+}
+```
+
+is discovered as:
+
+```text
+patient_appointment_documents ->
+  patientDisplayNameEncrypted
+  notes[].subjectEncrypted
+  notes[].noteTextEncrypted
+  notes[].prescriptionEncrypted
+```
+
+No copy of those names is hard-coded into the rotation engine.
+
+## Null behaviour
+
+A missing, `null`, or blank discovered encrypted value is **not decrypted and is not encrypted**:
+
+```java
+if (stored == null || stored.isBlank()) {
+    // count it as empty and leave it alone
+}
+```
+
+The utility never invents an encrypted value merely because the Java model contains an `*Encrypted` field.
+
+## Safety check against stale source
+
+Before a dry run or rotation, the utility also recursively checks MongoDB documents for properties ending in `Encrypted`.
+
+If MongoDB contains an `*Encrypted` path that is **not present in the selected Java model source**, the operation stops. This matters because otherwise an old encrypted value could be left behind using the old key while you retire that key.
+
+## Lookup hashes
+
+When a model contains sibling fields such as:
+
+```java
+private String displayNameEncrypted;
+private String displayNameLookupHash;
+```
+
+the lookup hash is automatically regenerated with the new key/salt-derived HMAC after the encrypted value is rotated. The rotator discovers this pairing by naming convention; it does not know application-specific field names.
+
+## GUI
+
+Build:
 
 ```bash
-mvn clean test
 mvn clean package
+```
+
+Run:
+
+```bash
 java -jar target/example-security-key-rotator.jar
 ```
 
-On Windows you can also run `run-gui.bat` after building.
+The first field is **MongoDB model source directory**. Select the Java folder containing the `@Document` model classes themselves, not the project root.
 
-## Safety
+Then provide:
 
-Use **Dry-run check** first. For a real rotation, take and verify a backup and stop/drain every backend instance. The GUI requires both confirmations and requires you to type `ROTATE` before writes begin.
+- MongoDB connection URL;
+- database name;
+- old passphrase and old Base64 master salt;
+- new passphrase and new Base64 master salt;
+- batch size.
 
-The filesystem scan is a safety gate; it does not modify your `example-security` source files. MongoDB remains the data being checked/rotated.
+Use **Dry-run check** before rotating. For an actual rotation the GUI requires confirmation that a verified backup exists and that all application backends using the database are stopped/drained.
 
-## Null values and removed fields
+## CLI
 
-A database value that is `null` or blank is classified as `NULL`; the rotator does not attempt to decrypt it. During rotation the corresponding active encrypted field remains null.
+Set:
 
-This is different from a field that is absent from the application source schema. An absent source-schema field is not part of the active rotation plan at all: the rotator does not decrypt it, create it, overwrite it, or clear any associated legacy field.
+```text
+ROTATOR_MODEL_SOURCE_DIR=<path to Java MongoDB model source directory>
+MONGODB_URI=<MongoDB URI>
+ROTATOR_DATABASE=<database name>
+OLD_FIELD_CRYPTO_PASSPHRASE=<old passphrase>
+OLD_FIELD_CRYPTO_MASTER_SALT_B64=<old salt>
+NEW_FIELD_CRYPTO_PASSPHRASE=<new passphrase>
+NEW_FIELD_CRYPTO_MASTER_SALT_B64=<new salt>
+ROTATOR_BATCH_SIZE=100
+ROTATOR_MODE=check
+```
 
-For CLI mode, set `EXAMPLE_SECURITY_PROJECT_DIR` to the root of the real `example-security` project.
+For a write rotation use `ROTATOR_MODE=rotate` and also set:
+
+```text
+APP_MAINTENANCE_CONFIRMED=true
+BACKUP_CONFIRMED=true
+ROTATION_CONFIRM=ROTATE
+```
+
+## Scope
+
+The selected Java model source is read-only. The tool never modifies application source code. The only write target during `rotate` is the selected MongoDB database plus the utility's rotation journal/lock collections.
+
+## Dry-run decryption diagnostics
+
+If a discovered `*Encrypted` value cannot be authenticated, the dry run remains read-only and stops safely. The GUI now reports the MongoDB collection, document `_id`, and exact field path (including nested array indexes) rather than exposing only the low-level JCE `Tag mismatch` text.
+
+A message saying that ciphertext matches neither the OLD nor NEW key/salt means AES-GCM authentication failed with both supplied secret sets. This is normally caused by an incorrect old passphrase/salt, a value written with another historical key/salt, or damaged ciphertext. Null and blank encrypted values continue to be skipped without decryption.
