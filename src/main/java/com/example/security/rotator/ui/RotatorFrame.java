@@ -3,6 +3,7 @@ package com.example.security.rotator.ui;
 import com.example.security.rotator.RotationConfig;
 import com.example.security.rotator.RotationEngine;
 import com.example.security.rotator.RotationReport;
+import com.example.security.rotator.ProjectSchemaScanner;
 
 import javax.swing.BorderFactory;
 import javax.swing.Box;
@@ -10,6 +11,7 @@ import javax.swing.BoxLayout;
 import javax.swing.JButton;
 import javax.swing.JCheckBox;
 import javax.swing.JFrame;
+import javax.swing.JFileChooser;
 import javax.swing.JLabel;
 import javax.swing.JOptionPane;
 import javax.swing.JPanel;
@@ -35,6 +37,7 @@ import java.awt.Insets;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.ExecutionException;
+import java.nio.file.Path;
 
 public final class RotatorFrame extends JFrame {
     private static final long serialVersionUID = 1L;
@@ -46,6 +49,7 @@ public final class RotatorFrame extends JFrame {
     private static final Color PRIMARY = new Color(13, 110, 253);
     private static final Color DANGER = new Color(220, 53, 69);
 
+    private final JTextField projectPath = new JTextField();
     private final JPasswordField mongoUri = new JPasswordField();
     private final JTextField database = new JTextField("example_security");
     private final JPasswordField oldPassphrase = new JPasswordField();
@@ -144,6 +148,15 @@ public final class RotatorFrame extends JFrame {
         panel.setBackground(CARD);
         panel.setAlignmentX(LEFT_ALIGNMENT);
         int row = 0;
+        JPanel projectRow = new JPanel(new BorderLayout(8, 0));
+        projectRow.setBackground(CARD);
+        projectRow.add(projectPath, BorderLayout.CENTER);
+        JButton browseProject = button("Browse…", new Color(108, 117, 125));
+        browseProject.addActionListener(event -> chooseProjectDirectory());
+        projectRow.add(browseProject, BorderLayout.EAST);
+        addField(panel, row++, "ExampleSecurity project directory", projectRow,
+                "Select the folder containing backend/src/main/java");
+
         addField(panel, row++, "MongoDB connection URL", mongoUri,
                 "Use the Atlas or TLS/allowlisted Krystal backup-style URL");
         addField(panel, row++, "Database", database, "Normally example_security");
@@ -238,6 +251,23 @@ public final class RotatorFrame extends JFrame {
         return c;
     }
 
+    private void chooseProjectDirectory() {
+        JFileChooser chooser = new JFileChooser();
+        chooser.setDialogTitle("Select ExampleSecurity project directory");
+        chooser.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
+        if (!projectPath.getText().isBlank()) chooser.setCurrentDirectory(new java.io.File(projectPath.getText()));
+        if (chooser.showOpenDialog(this) == JFileChooser.APPROVE_OPTION) {
+            projectPath.setText(chooser.getSelectedFile().getAbsolutePath());
+        }
+    }
+
+    private ProjectSchemaScanner.SchemaReport requireFilesystemSchema() {
+        ProjectSchemaScanner.SchemaReport report = new ProjectSchemaScanner()
+                .scanAndRequireCompatible(Path.of(projectPath.getText().trim()));
+        output.append(report.summary() + System.lineSeparator() + System.lineSeparator());
+        return report;
+    }
+
     private void wireActions() {
         connectButton.addActionListener(event -> testConnection());
         checkButton.addActionListener(event -> start(false));
@@ -248,6 +278,7 @@ public final class RotatorFrame extends JFrame {
     }
 
     private void testConnection() {
+        try { requireFilesystemSchema(); } catch (RuntimeException ex) { showError(ex); return; }
         char[] uri = mongoUri.getPassword();
         setBusy(true, "Testing MongoDB connection…");
         SwingWorker<Void, Void> connectionWorker = new SwingWorker<>() {
@@ -273,6 +304,8 @@ public final class RotatorFrame extends JFrame {
     }
 
     private void start(boolean rotate) {
+        final ProjectSchemaScanner.SchemaReport filesystemSchema;
+        try { filesystemSchema = requireFilesystemSchema(); } catch (RuntimeException ex) { showError(ex); return; }
         if (rotate && (!backupConfirmed.isSelected() || !maintenanceConfirmed.isSelected())) {
             JOptionPane.showMessageDialog(this,
                     "Confirm both the verified backup and maintenance shutdown first.",
@@ -299,7 +332,7 @@ public final class RotatorFrame extends JFrame {
         setBusy(true, rotate ? "Rotation running" : "Dry-run check running");
         worker = new SwingWorker<>() {
             @Override protected RotationReport doInBackground() {
-                RotationEngine engine = new RotationEngine();
+                RotationEngine engine = new RotationEngine(filesystemSchema.collections());
                 return rotate
                         ? engine.rotate(config, (message, count) -> publish(message + " — " + count + " documents"))
                         : engine.check(config, (message, count) -> publish(message + " — " + count + " documents"));

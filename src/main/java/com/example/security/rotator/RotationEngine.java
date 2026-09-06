@@ -17,6 +17,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 
@@ -41,6 +42,37 @@ public final class RotationEngine {
             "patientDisplayNameEncrypted", "patientTelephoneEncrypted", "clinicNameEncrypted",
             "clinicianEncrypted", "prescriptionEncrypted", "notes[].subjectEncrypted",
             "notes[].noteTextEncrypted", "notes[].prescriptionEncrypted");
+
+    private final Map<String, Set<String>> activeEncryptedPaths;
+
+    /**
+     * Uses the encrypted paths discovered from the actual ExampleSecurity source tree.
+     * A path that is not present in that filesystem-derived schema is never decrypted,
+     * encrypted, created, or nulled in MongoDB.
+     */
+    public RotationEngine(Map<String, Set<String>> activeEncryptedPaths) {
+        if (activeEncryptedPaths == null) throw new IllegalArgumentException("Filesystem schema is required");
+        this.activeEncryptedPaths = activeEncryptedPaths.entrySet().stream()
+                .collect(java.util.stream.Collectors.toUnmodifiableMap(
+                        Map.Entry::getKey, e -> Set.copyOf(e.getValue())));
+    }
+
+    /**
+     * Kept for compatibility with older callers. The filesystem-schema GUI and CLI do not
+     * use this constructor; they always pass a scanned schema.
+     */
+    public RotationEngine() {
+        this(Map.of(USERS, USER_ENCRYPTED_PATHS, OFFICES, OFFICE_ENCRYPTED_PATHS,
+                APPOINTMENTS, APPOINTMENT_ENCRYPTED_PATHS));
+    }
+
+    private Set<String> active(String collection) {
+        return activeEncryptedPaths.getOrDefault(collection, Set.of());
+    }
+
+    private boolean active(String collection, String path) {
+        return active(collection).contains(path);
+    }
 
     public void testConnection(RotationConfig config) {
         try (MongoClient client = MongoClients.create(config.mongoUri())) {
@@ -125,60 +157,66 @@ public final class RotationEngine {
                                         FieldCrypto newCrypto, int batchSize,
                                         ProgressListener progress) {
         RotationReport.Mutable stats = new RotationReport.Mutable();
-        scanCollection(database.getCollection(USERS), batchSize, stats, progress,
-                (document, ignored) -> scanUser(document, oldCrypto, newCrypto, stats));
-        scanCollection(database.getCollection(OFFICES), batchSize, stats, progress,
-                (document, ignored) -> scanOffice(document, oldCrypto, newCrypto, stats));
-        scanCollection(database.getCollection(APPOINTMENTS), batchSize, stats, progress,
-                (document, ignored) -> scanAppointment(document, oldCrypto, newCrypto, stats));
+        if (!active(USERS).isEmpty())
+            scanCollection(database.getCollection(USERS), batchSize, stats, progress,
+                    (document, ignored) -> scanUser(document, oldCrypto, newCrypto, stats));
+        if (!active(OFFICES).isEmpty())
+            scanCollection(database.getCollection(OFFICES), batchSize, stats, progress,
+                    (document, ignored) -> scanOffice(document, oldCrypto, newCrypto, stats));
+        if (!active(APPOINTMENTS).isEmpty())
+            scanCollection(database.getCollection(APPOINTMENTS), batchSize, stats, progress,
+                    (document, ignored) -> scanAppointment(document, oldCrypto, newCrypto, stats));
         return stats;
     }
 
     private void scanUser(Document user, FieldCrypto oldCrypto, FieldCrypto newCrypto,
                           RotationReport.Mutable stats) {
+        Set<String> paths = active(USERS);
         rejectUnknownEncryptedPaths(user, USER_ENCRYPTED_PATHS, USERS, user.get("_id"));
-        scanValue(user.getString("displayNameEncrypted"), oldCrypto, newCrypto, stats,
-                USERS, user.get("_id"), "displayNameEncrypted");
-        scanValue(user.getString("telephoneEncrypted"), oldCrypto, newCrypto, stats,
-                USERS, user.get("_id"), "telephoneEncrypted");
-        scanValue(user.getString("totpSecretEncrypted"), oldCrypto, newCrypto, stats,
-                USERS, user.get("_id"), "totpSecretEncrypted");
+        if (paths.contains("displayNameEncrypted"))
+            scanValue(user.getString("displayNameEncrypted"), oldCrypto, newCrypto, stats, USERS, user.get("_id"), "displayNameEncrypted");
+        if (paths.contains("telephoneEncrypted"))
+            scanValue(user.getString("telephoneEncrypted"), oldCrypto, newCrypto, stats, USERS, user.get("_id"), "telephoneEncrypted");
+        if (paths.contains("totpSecretEncrypted"))
+            scanValue(user.getString("totpSecretEncrypted"), oldCrypto, newCrypto, stats, USERS, user.get("_id"), "totpSecretEncrypted");
     }
 
     private void scanOffice(Document office, FieldCrypto oldCrypto, FieldCrypto newCrypto,
                             RotationReport.Mutable stats) {
+        Set<String> paths = active(OFFICES);
         rejectUnknownEncryptedPaths(office, OFFICE_ENCRYPTED_PATHS, OFFICES, office.get("_id"));
-        scanValue(office.getString("addressEncrypted"), oldCrypto, newCrypto, stats,
-                OFFICES, office.get("_id"), "addressEncrypted");
-        scanValue(office.getString("telephoneEncrypted"), oldCrypto, newCrypto, stats,
-                OFFICES, office.get("_id"), "telephoneEncrypted");
+        if (paths.contains("addressEncrypted"))
+            scanValue(office.getString("addressEncrypted"), oldCrypto, newCrypto, stats, OFFICES, office.get("_id"), "addressEncrypted");
+        if (paths.contains("telephoneEncrypted"))
+            scanValue(office.getString("telephoneEncrypted"), oldCrypto, newCrypto, stats, OFFICES, office.get("_id"), "telephoneEncrypted");
     }
 
     private void scanAppointment(Document appointment, FieldCrypto oldCrypto, FieldCrypto newCrypto,
                                  RotationReport.Mutable stats) {
         Object id = appointment.get("_id");
+        Set<String> paths = active(APPOINTMENTS);
         rejectUnknownEncryptedPaths(appointment, APPOINTMENT_ENCRYPTED_PATHS, APPOINTMENTS, id);
-        scanValue(withLegacy(appointment, "patientDisplayNameEncrypted", "patientDisplayName"),
-                oldCrypto, newCrypto, stats, APPOINTMENTS, id, "patientDisplayNameEncrypted");
-        scanValue(appointment.getString("patientTelephoneEncrypted"), oldCrypto, newCrypto, stats,
-                APPOINTMENTS, id, "patientTelephoneEncrypted");
-        scanValue(withLegacy(appointment, "clinicNameEncrypted", "clinicName"),
-                oldCrypto, newCrypto, stats, APPOINTMENTS, id, "clinicNameEncrypted");
-        scanValue(withLegacy(appointment, "clinicianEncrypted", "clinician"),
-                oldCrypto, newCrypto, stats, APPOINTMENTS, id, "clinicianEncrypted");
-        scanValue(withLegacy(appointment, "prescriptionEncrypted", "prescription"),
-                oldCrypto, newCrypto, stats, APPOINTMENTS, id, "prescriptionEncrypted");
+        if (paths.contains("patientDisplayNameEncrypted"))
+            scanValue(withLegacy(appointment, "patientDisplayNameEncrypted", "patientDisplayName"), oldCrypto, newCrypto, stats, APPOINTMENTS, id, "patientDisplayNameEncrypted");
+        if (paths.contains("patientTelephoneEncrypted"))
+            scanValue(appointment.getString("patientTelephoneEncrypted"), oldCrypto, newCrypto, stats, APPOINTMENTS, id, "patientTelephoneEncrypted");
+        if (paths.contains("clinicNameEncrypted"))
+            scanValue(withLegacy(appointment, "clinicNameEncrypted", "clinicName"), oldCrypto, newCrypto, stats, APPOINTMENTS, id, "clinicNameEncrypted");
+        if (paths.contains("clinicianEncrypted"))
+            scanValue(withLegacy(appointment, "clinicianEncrypted", "clinician"), oldCrypto, newCrypto, stats, APPOINTMENTS, id, "clinicianEncrypted");
+        if (paths.contains("prescriptionEncrypted"))
+            scanValue(withLegacy(appointment, "prescriptionEncrypted", "prescription"), oldCrypto, newCrypto, stats, APPOINTMENTS, id, "prescriptionEncrypted");
 
         List<Document> notes = documents(appointment.get("notes"));
         for (int index = 0; index < notes.size(); index++) {
             Document note = notes.get(index);
             stats.notes++;
-            scanValue(withLegacy(note, "subjectEncrypted", "subject"), oldCrypto, newCrypto,
-                    stats, APPOINTMENTS, id, "notes[" + index + "].subjectEncrypted");
-            scanValue(withLegacy(note, "noteTextEncrypted", "noteText"), oldCrypto, newCrypto,
-                    stats, APPOINTMENTS, id, "notes[" + index + "].noteTextEncrypted");
-            scanValue(withLegacy(note, "prescriptionEncrypted", "prescription"), oldCrypto, newCrypto,
-                    stats, APPOINTMENTS, id, "notes[" + index + "].prescriptionEncrypted");
+            if (paths.contains("notes[].subjectEncrypted"))
+                scanValue(withLegacy(note, "subjectEncrypted", "subject"), oldCrypto, newCrypto, stats, APPOINTMENTS, id, "notes[" + index + "].subjectEncrypted");
+            if (paths.contains("notes[].noteTextEncrypted"))
+                scanValue(withLegacy(note, "noteTextEncrypted", "noteText"), oldCrypto, newCrypto, stats, APPOINTMENTS, id, "notes[" + index + "].noteTextEncrypted");
+            if (paths.contains("notes[].prescriptionEncrypted"))
+                scanValue(withLegacy(note, "prescriptionEncrypted", "prescription"), oldCrypto, newCrypto, stats, APPOINTMENTS, id, "notes[" + index + "].prescriptionEncrypted");
         }
     }
 
@@ -195,57 +233,66 @@ public final class RotationEngine {
 
     private void rotateUsers(MongoDatabase database, FieldCrypto oldCrypto, FieldCrypto newCrypto,
                              int batchSize, RotationReport.Mutable stats, ProgressListener progress) {
+        if (active(USERS).isEmpty()) return;
         transformCollection(database.getCollection(USERS), batchSize, stats, progress,
                 (user, sets) -> {
-                    rotateAndSet(user, sets, "displayNameEncrypted", null, "displayNameLookupHash",
-                            oldCrypto, newCrypto, stats, USERS);
-                    rotateAndSet(user, sets, "telephoneEncrypted", null, null,
-                            oldCrypto, newCrypto, stats, USERS);
-                    rotateAndSet(user, sets, "totpSecretEncrypted", null, null,
-                            oldCrypto, newCrypto, stats, USERS);
+                    if (active(USERS, "displayNameEncrypted"))
+                        rotateAndSet(user, sets, "displayNameEncrypted", null, "displayNameLookupHash", oldCrypto, newCrypto, stats, USERS);
+                    if (active(USERS, "telephoneEncrypted"))
+                        rotateAndSet(user, sets, "telephoneEncrypted", null, null, oldCrypto, newCrypto, stats, USERS);
+                    if (active(USERS, "totpSecretEncrypted"))
+                        rotateAndSet(user, sets, "totpSecretEncrypted", null, null, oldCrypto, newCrypto, stats, USERS);
                 });
     }
 
     private void rotateOffices(MongoDatabase database, FieldCrypto oldCrypto, FieldCrypto newCrypto,
                                int batchSize, RotationReport.Mutable stats, ProgressListener progress) {
+        if (active(OFFICES).isEmpty()) return;
         transformCollection(database.getCollection(OFFICES), batchSize, stats, progress,
                 (office, sets) -> {
-                    rotateAndSet(office, sets, "addressEncrypted", null, null,
-                            oldCrypto, newCrypto, stats, OFFICES);
-                    rotateAndSet(office, sets, "telephoneEncrypted", null, null,
-                            oldCrypto, newCrypto, stats, OFFICES);
+                    if (active(OFFICES, "addressEncrypted"))
+                        rotateAndSet(office, sets, "addressEncrypted", null, null, oldCrypto, newCrypto, stats, OFFICES);
+                    if (active(OFFICES, "telephoneEncrypted"))
+                        rotateAndSet(office, sets, "telephoneEncrypted", null, null, oldCrypto, newCrypto, stats, OFFICES);
                 });
     }
 
     private void rotateAppointments(MongoDatabase database, FieldCrypto oldCrypto, FieldCrypto newCrypto,
                                     int batchSize, RotationReport.Mutable stats, ProgressListener progress) {
+        if (active(APPOINTMENTS).isEmpty()) return;
         transformCollection(database.getCollection(APPOINTMENTS), batchSize, stats, progress,
                 (appointment, sets) -> {
-                    rotateAndSet(appointment, sets, "patientDisplayNameEncrypted", "patientDisplayName",
-                            "patientDisplayNameLookupHash", oldCrypto, newCrypto, stats, APPOINTMENTS);
-                    rotateAndSet(appointment, sets, "patientTelephoneEncrypted", null, null,
-                            oldCrypto, newCrypto, stats, APPOINTMENTS);
-                    rotateAndSet(appointment, sets, "clinicNameEncrypted", "clinicName", null,
-                            oldCrypto, newCrypto, stats, APPOINTMENTS);
-                    rotateAndSet(appointment, sets, "clinicianEncrypted", "clinician", null,
-                            oldCrypto, newCrypto, stats, APPOINTMENTS);
-                    rotateAndSet(appointment, sets, "prescriptionEncrypted", "prescription", null,
-                            oldCrypto, newCrypto, stats, APPOINTMENTS);
+                    if (active(APPOINTMENTS, "patientDisplayNameEncrypted"))
+                        rotateAndSet(appointment, sets, "patientDisplayNameEncrypted", "patientDisplayName", "patientDisplayNameLookupHash", oldCrypto, newCrypto, stats, APPOINTMENTS);
+                    if (active(APPOINTMENTS, "patientTelephoneEncrypted"))
+                        rotateAndSet(appointment, sets, "patientTelephoneEncrypted", null, null, oldCrypto, newCrypto, stats, APPOINTMENTS);
+                    if (active(APPOINTMENTS, "clinicNameEncrypted"))
+                        rotateAndSet(appointment, sets, "clinicNameEncrypted", "clinicName", null, oldCrypto, newCrypto, stats, APPOINTMENTS);
+                    if (active(APPOINTMENTS, "clinicianEncrypted"))
+                        rotateAndSet(appointment, sets, "clinicianEncrypted", "clinician", null, oldCrypto, newCrypto, stats, APPOINTMENTS);
+                    if (active(APPOINTMENTS, "prescriptionEncrypted"))
+                        rotateAndSet(appointment, sets, "prescriptionEncrypted", "prescription", null, oldCrypto, newCrypto, stats, APPOINTMENTS);
 
+                    boolean rotateNotes = active(APPOINTMENTS, "notes[].subjectEncrypted")
+                            || active(APPOINTMENTS, "notes[].noteTextEncrypted")
+                            || active(APPOINTMENTS, "notes[].prescriptionEncrypted");
                     List<Document> notes = documents(appointment.get("notes"));
-                    if (!notes.isEmpty()) {
+                    if (rotateNotes && !notes.isEmpty()) {
                         List<Document> rotatedNotes = new ArrayList<>(notes.size());
                         for (Document original : notes) {
                             Document note = new Document(original);
-                            rotateNested(note, "subjectEncrypted", "subject", oldCrypto, newCrypto, stats,
-                                    APPOINTMENTS, appointment.get("_id"));
-                            rotateNested(note, "noteTextEncrypted", "noteText", oldCrypto, newCrypto, stats,
-                                    APPOINTMENTS, appointment.get("_id"));
-                            rotateNested(note, "prescriptionEncrypted", "prescription", oldCrypto, newCrypto,
-                                    stats, APPOINTMENTS, appointment.get("_id"));
-                            note.remove("subject");
-                            note.remove("noteText");
-                            note.remove("prescription");
+                            if (active(APPOINTMENTS, "notes[].subjectEncrypted")) {
+                                rotateNested(note, "subjectEncrypted", "subject", oldCrypto, newCrypto, stats, APPOINTMENTS, appointment.get("_id"));
+                                note.remove("subject");
+                            }
+                            if (active(APPOINTMENTS, "notes[].noteTextEncrypted")) {
+                                rotateNested(note, "noteTextEncrypted", "noteText", oldCrypto, newCrypto, stats, APPOINTMENTS, appointment.get("_id"));
+                                note.remove("noteText");
+                            }
+                            if (active(APPOINTMENTS, "notes[].prescriptionEncrypted")) {
+                                rotateNested(note, "prescriptionEncrypted", "prescription", oldCrypto, newCrypto, stats, APPOINTMENTS, appointment.get("_id"));
+                                note.remove("prescription");
+                            }
                             rotatedNotes.add(note);
                             stats.notes++;
                         }

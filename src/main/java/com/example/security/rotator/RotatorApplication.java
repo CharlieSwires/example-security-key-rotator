@@ -21,7 +21,14 @@ public final class RotatorApplication {
     static int runCli(Map<String, String> env) {
         String mode = env.getOrDefault("ROTATOR_MODE", "check").trim().toLowerCase(Locale.ROOT);
         try (RotationConfig config = RotationConfig.fromEnvironment(env)) {
-            RotationEngine engine = new RotationEngine();
+            String projectDir = env.get("EXAMPLE_SECURITY_PROJECT_DIR");
+            if (projectDir == null || projectDir.isBlank()) {
+                throw new IllegalArgumentException("EXAMPLE_SECURITY_PROJECT_DIR is required for the filesystem-schema rotator");
+            }
+            ProjectSchemaScanner.SchemaReport schema = new ProjectSchemaScanner()
+                    .scanAndRequireCompatible(java.nio.file.Path.of(projectDir));
+            System.out.println(schema.summary());
+            RotationEngine engine = new RotationEngine(schema.collections());
             RotationReport report;
             if ("check".equals(mode)) {
                 report = engine.check(config, ProgressListener.CONSOLE);
