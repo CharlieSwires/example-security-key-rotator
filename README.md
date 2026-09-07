@@ -148,3 +148,19 @@ The selected Java model source is read-only. The tool never modifies application
 If a discovered `*Encrypted` value cannot be authenticated, the dry run remains read-only and stops safely. The GUI now reports the MongoDB collection, document `_id`, and exact field path (including nested array indexes) rather than exposing only the low-level JCE `Tag mismatch` text.
 
 A message saying that ciphertext matches neither the OLD nor NEW key/salt means AES-GCM authentication failed with both supplied secret sets. This is normally caused by an incorrect old passphrase/salt, a value written with another historical key/salt, or damaged ciphertext. Null and blank encrypted values continue to be skipped without decryption.
+
+14 Random Word Generator
+========================
+
+How to Compile
+==============
+
+<p>cd ~/eclipse-workspace/example-security-key-rotator/src/main/java/com/example/security/random/words/util</p>
+<p>javac *.java</p>
+<p>./get-words.sh</p>
+
+How to Run
+==========
+
+<p>cd ~/eclipse-workspace/example-security-key-rotator</p>
+<p>java -cp src/main/java com.example.security.random.words.util.RandomPassphraseGenerator</p>
